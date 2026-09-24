@@ -1,0 +1,15 @@
+# 模型、生成结果、本地引擎
+/models/
+/outputs/
+/bin/
+/dist/
+*.app
+*.dmg
+
+# 构建产物
+app/.build/
+app/vendor/sd-cli
+app/icon/AppIcon.iconset/
+app/icon/icon_1024.png
+.DS_Store
+.swiftpm/
