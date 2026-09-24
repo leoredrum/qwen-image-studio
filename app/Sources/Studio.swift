@@ -221,25 +221,40 @@ final class Studio {
     }
 
     // MARK: 连续修改
-    /// 右侧当前显示的已完成图片 —— 「接着改」的底图
-    var chainSource: String? {
-        guard let item = selectedItem, item.status == .done, let o = selectedOutput, item.outputs.contains(o) else { return nil }
-        return o
+    /// 只对下一次发送生效：不接着改，重新画一张
+    var freshNext = false
+
+    private static let pending: Set<ItemStatus> = [.thinking, .queued, .running]
+
+    /// 「接着改」的目标轮次：右侧选中的那一轮（已完成或还在生成），否则是对话里最近完成的一轮
+    var chainTarget: ChatItem? {
+        guard !freshNext else { return nil }
+        if let s = selectedItem, (s.status == .done && !s.outputs.isEmpty) || Self.pending.contains(s.status) { return s }
+        return items.last { $0.status == .done && !$0.outputs.isEmpty }
     }
 
-    var isChaining: Bool {
-        guard settings.chainEdits, let c = chainSource else { return false }
-        return !refImages.contains(c)
+    /// 目标轮次已完成时的底图（右侧选中哪张就用哪张）
+    var chainSource: String? {
+        guard let t = chainTarget, t.status == .done else { return nil }
+        if t.id == selectedItemID, let o = selectedOutput, t.outputs.contains(o) { return o }
+        return t.outputs.first
     }
+
+    /// 目标轮次还在生成：发送后排队，等它画完再接着改
+    var chainPending: Bool { chainTarget.map { Self.pending.contains($0.status) } ?? false }
+
+    var isChaining: Bool { chainTarget != nil }
 
     /// 本次生成实际使用的参考图：接着改的底图 + 手动添加的参考图
     var effectiveRefs: [String] {
-        isChaining ? [chainSource!] + refImages.prefix(9) : refImages
+        guard let c = chainSource, !refImages.contains(c) else { return refImages }
+        return [c] + refImages.prefix(9)
     }
 
     // MARK: 生成
     var targetSize: (Int, Int) {
         if settings.customSize { return (settings.width, settings.height) }
+        if settings.followRefSize, chainPending, let t = chainTarget { return (t.params.width, t.params.height) }
         if settings.followRefSize, let first = effectiveRefs.first, let rep = NSImageRep(contentsOf: url(first)),
            rep.pixelsWide > 0, rep.pixelsHigh > 0 {
             return fitSize(aspect: Double(rep.pixelsWide) / Double(rep.pixelsHigh), megapixels: settings.tier.megapixels)
@@ -274,15 +289,18 @@ final class Studio {
         let (w, h) = targetSize
         var neg = s.negative.trimmingCharacters(in: .whitespacesAndNewlines)
         if !s.nsfw { neg = neg.isEmpty ? safetyNegative : neg + ", " + safetyNegative }
-        let params = GenParams(
+        var params = GenParams(
             prompt: prompt, negative: neg, width: w, height: h, steps: s.steps, cfg: s.cfg,
             seed: s.randomSeed ? Int.random(in: 0..<2_147_483_647) : s.seed,
             sampler: s.sampler, scheduler: s.scheduler, batch: s.batch,
             diffusionModel: s.diffusionModel, textEncoder: s.textEncoder,
             nsfw: s.nsfw, fastMode: s.fastMode, refImages: effectiveRefs)
-        let chained = isChaining ? chainSource : nil
+        let chained = chainSource.flatMap { effectiveRefs.first == $0 ? $0 : nil }
+        if chainPending { params.chainFrom = chainTarget?.id }
+        let previous = chainTarget?.params.prompt
         draft = ""
         refImages = []
+        freshNext = false
         guard s.assistant else { enqueue(params); return }
 
         // 先交给提示词助手理解上下文，再入队
@@ -293,7 +311,6 @@ final class Studio {
         selectedItemID = item.id
         selectedOutput = nil
         let id = item.id
-        let previous = chained.flatMap { c in items.first { $0.outputs.contains(c) }?.params.prompt }
         Task {
             do {
                 let r = try await Assistant.rewrite(text: prompt, previousPrompt: previous, model: s.assistantModel)
@@ -301,8 +318,11 @@ final class Studio {
                     it.params.prompt = r.prompt
                     it.params.assistantMode = r.mode
                     it.params.assistantNote = r.reason
-                    // 判定为重画：不再以上一张为底图，改为文生图
-                    if r.mode == "generate", let c = chained { it.params.refImages.removeAll { $0 == c } }
+                    // 用户明确要求画一张全新的：不再以上一张为底图
+                    if r.mode == "generate" {
+                        if let c = chained { it.params.refImages.removeAll { $0 == c } }
+                        it.params.chainFrom = nil
+                    }
                 }
             } catch {
                 update(id) { $0.params.assistantNote = "助手不可用，已按原话生成：\(error.localizedDescription)" }
@@ -354,8 +374,11 @@ final class Studio {
 
     func cancel() { engine.cancel() }
 
+    /// 严格按对话顺序执行：前面还有在理解中的，就先等它，保证「接着改」拿到的是上一轮的结果
     private func pump() {
-        guard runningID == nil, let item = items.first(where: { $0.status == .queued }) else { return }
+        guard runningID == nil,
+              let item = items.first(where: { $0.status == .queued || $0.status == .thinking }),
+              item.status == .queued else { return }
         Task { await run(item.id) }
     }
 
@@ -365,6 +388,14 @@ final class Studio {
     }
 
     private func run(_ id: UUID) async {
+        // 发送时上一轮还没画完：现在取它的结果作为底图
+        if let from = items.first(where: { $0.id == id })?.params.chainFrom {
+            let base = items.first { $0.id == from }?.outputs.first
+            update(id) { it in
+                it.params.chainFrom = nil
+                if let base, !it.params.refImages.contains(base) { it.params.refImages.insert(base, at: 0) }
+            }
+        }
         guard let item = items.first(where: { $0.id == id }) else { return }
         let p = item.params
         runningID = id

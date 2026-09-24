@@ -55,29 +55,37 @@ struct Composer: View {
 
     /// 「接着改」：以右侧当前图片为底图继续修改
     @ViewBuilder private var chainBar: some View {
-        if let src = studio.chainSource, !studio.refImages.contains(src) {
-            if studio.settings.chainEdits {
-                HStack(spacing: 8) {
+        if let target = studio.chainTarget {
+            HStack(spacing: 8) {
+                if let src = studio.chainSource {
                     Thumb(rel: src, size: 34)
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text("接着改这张").font(.callout.weight(.semibold))
-                        Text("在右侧或历史里点别的图可切换底图").font(.caption2).foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Button { studio.settings.chainEdits = false } label: {
-                        Label("画新图", systemImage: "xmark")
-                    }
-                    .buttonStyle(.borderless).font(.caption)
-                    .help("不基于当前图，重新生成一张全新的")
+                } else {
+                    ProgressView().controlSize(.small).frame(width: 34, height: 34)
                 }
-                .padding(6)
-                .background(RoundedRectangle(cornerRadius: 10).fill(Color.accentColor.opacity(0.12)))
-            } else {
-                Button { studio.settings.chainEdits = true } label: {
-                    Label("基于右侧这张图接着改", systemImage: "arrow.triangle.branch")
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(studio.chainPending ? "等上一张画完后接着改" : "接着改这张").font(.callout.weight(.semibold))
+                    Text(target.params.userText ?? target.params.prompt)
+                        .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                }
+                Spacer()
+                Button { studio.freshNext = true } label: {
+                    Label("画新图", systemImage: "plus.square")
                 }
                 .buttonStyle(.borderless).font(.caption)
+                .help("下一次不基于上一张，重新画一张全新的（只对下一次生效）")
             }
+            .padding(6)
+            .background(RoundedRectangle(cornerRadius: 10).fill(Color.accentColor.opacity(0.12)))
+        } else if studio.freshNext {
+            HStack(spacing: 8) {
+                Image(systemName: "plus.square.fill").foregroundStyle(.tint)
+                Text("下一张将重新画").font(.callout.weight(.semibold))
+                Spacer()
+                Button("撤销，接着改") { studio.freshNext = false }
+                    .buttonStyle(.borderless).font(.caption)
+            }
+            .padding(6)
+            .background(RoundedRectangle(cornerRadius: 10).fill(Color.secondary.opacity(0.12)))
         }
     }
 

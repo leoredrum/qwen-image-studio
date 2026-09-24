@@ -192,6 +192,7 @@ struct GenParams: Codable, Hashable {
     var userText: String?        // 用户原话（经过助手改写时才有）
     var assistantMode: String?   // generate | edit
     var assistantNote: String?   // 助手的判断理由或错误信息
+    var chainFrom: UUID?         // 发送时上一轮还没画完：等它完成后以它的结果为底图
 
     var modelShortName: String {
         diffusionModel.replacingOccurrences(of: "qwen-image-2.1-", with: "").replacingOccurrences(of: ".gguf", with: "")
