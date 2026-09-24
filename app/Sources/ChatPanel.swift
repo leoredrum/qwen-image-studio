@@ -195,6 +195,7 @@ struct ChatRow: View {
                     HStack(spacing: 4) {
                         if item.isEdit { Label("改图", systemImage: "wand.and.stars").labelStyle(.titleAndIcon) }
                         if item.params.nsfw { Text("NSFW") }
+                        if item.params.transparent == true { Text("透明") }
                         if item.params.fastMode { Image(systemName: "bolt.fill") }
                         Text(item.params.summary)
                     }
@@ -229,6 +230,7 @@ struct ChatRow: View {
                     ForEach(item.outputs, id: \.self) { o in
                         let sel = studio.selectedItemID == item.id && studio.selectedOutput == o
                         Thumb(rel: o, size: cols == 1 ? 260 : 150)
+                            .background { if item.params.transparent == true { Checkerboard(cell: 8).clipShape(RoundedRectangle(cornerRadius: 10)) } }
                             .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(sel ? Color.accentColor : .clear, lineWidth: 3))
                             .onTapGesture { studio.select(item, output: o) }
                             .onDrag { NSItemProvider(contentsOf: studio.url(o)) ?? NSItemProvider() }
@@ -267,8 +269,8 @@ struct ChatRow: View {
                 HStack(spacing: 6) {
                     Image(systemName: "sparkles")
                     switch p.assistantMode {
-                    case "generate": Text(p.refImages.isEmpty ? "助手：重新构图" : "助手：参考图 + 重新构图").fontWeight(.semibold)
-                    case "edit": Text("助手：局部修改").fontWeight(.semibold)
+                    case "generate": Text(p.refImages.isEmpty ? "助手：文生图" : "助手：参考图 + 重新构图").fontWeight(.semibold)
+                    case "edit": Text("助手：接着改").fontWeight(.semibold)
                     default: Text("助手未参与").fontWeight(.semibold)
                     }
                 }

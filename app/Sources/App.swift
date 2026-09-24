@@ -42,11 +42,11 @@ struct ContentView: View {
         @Bindable var studio = studio
         HSplitView {
             ChatPanel()
-                .frame(minWidth: 400, idealWidth: 460, maxWidth: 680)
+                .frame(minWidth: 590, idealWidth: 600, maxWidth: 760)
             ViewerPanel()
                 .frame(minWidth: 520, maxWidth: .infinity)
         }
-        .frame(minWidth: 1040, minHeight: 700)
+        .frame(minWidth: 1120, minHeight: 700)
         .sheet(isPresented: $studio.showModelManager) {
             ModelManagerView().environment(studio)
         }

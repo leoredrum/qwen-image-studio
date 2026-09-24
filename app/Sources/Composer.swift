@@ -176,6 +176,9 @@ struct Composer: View {
                 .pickerStyle(.inline)
                 Divider()
                 Toggle("⚡ 加速（EasyCache 跳步）", isOn: $studio.settings.fastMode)
+                Divider()
+                Toggle("透明背景 PNG", isOn: $studio.settings.transparent)
+                Toggle("去除 VAE 网格", isOn: $studio.settings.degrid)
             } label: {
                 Label(QualityPreset.label(for: studio.settings.steps), systemImage: studio.settings.fastMode ? "bolt.fill" : "sparkles")
             }
@@ -211,9 +214,12 @@ struct Composer: View {
             Spacer(minLength: 4)
 
             if studio.runningID == nil {
-                Text("≈ \(formatDuration(studio.estimate))")
-                    .font(.caption).foregroundStyle(.secondary).monospacedDigit()
-                    .help("按实测速度估算的耗时")
+                ViewThatFits(in: .horizontal) {
+                    Text("≈ \(formatDuration(studio.estimate))")
+                        .font(.caption).foregroundStyle(.secondary).monospacedDigit().lineLimit(1).fixedSize()
+                    Color.clear.frame(width: 0, height: 0)
+                }
+                .help("按实测速度估算的耗时")
             } else if studio.items.contains(where: { $0.status == .queued }) {
                 Text("排队 \(studio.items.filter { $0.status == .queued }.count)")
                     .font(.caption).foregroundStyle(.secondary)
@@ -307,7 +313,24 @@ struct MoreSettings: View {
             Section("提示词助手（本地 Ollama）") {
                 if studio.assistantAvailable {
                     Toggle("开启提示词助手", isOn: $studio.settings.assistant)
-                    Picker("语言模型", selection: $studio.settings.assistantModel) {
+                    if studio.peInstalled {
+                        Toggle("使用官方改写模型（推荐）", isOn: $studio.settings.useOfficialPE)
+                        Toggle("让助手决定画面比例", isOn: $studio.settings.peRatio)
+                    } else if studio.pePull.isEmpty {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Button("安装 Qwen 官方改写模型（约 12GB）") { studio.installPE() }
+                            Text("官方为 Qwen-Image-2.1 专门训练的提示词改写模型：文生图、改图各一个，改图时能看到上一张图。").font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    ForEach(studio.pePull.keys.sorted(), id: \.self) { name in
+                        let (p, status) = studio.pePull[name]!
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(name.contains("I2I") ? "改图改写模型" : "文生图改写模型").font(.caption)
+                            ProgressView(value: p) { Text(status).font(.caption2).foregroundStyle(.secondary) }
+                        }
+                    }
+                    if let e = studio.pePullError { Text(e).font(.caption).foregroundStyle(.red) }
+                    Picker(studio.peInstalled && studio.settings.useOfficialPE ? "备用通用模型" : "语言模型", selection: $studio.settings.assistantModel) {
                         ForEach(Array(Set((studio.ollamaModels ?? []) + [studio.settings.assistantModel])).sorted(), id: \.self) { Text($0).tag($0) }
                     }
                 } else {
@@ -315,8 +338,17 @@ struct MoreSettings: View {
                         .font(.caption)
                     Button("重新检测") { Task { await studio.checkOllama() } }
                 }
-                Text("理解对话上下文：大改（视角、构图、位置）自动重画，小改（颜色、配饰、表情）以上一张为底图局部修改；并把否定句、纠错句改写成图像模型能理解的正面描述。")
+                Text(studio.peInstalled && studio.settings.useOfficialPE
+                     ? "发送后由官方模型先思考再改写（约 20~60 秒），输出详细的英文描述，并自动选择合适的画面比例。"
+                     : "理解对话上下文，把口语、否定句、纠错句改写成图像模型能理解的正面描述。")
                     .font(.caption).foregroundStyle(.secondary)
+            }
+
+            Section("输出") {
+                Toggle("透明背景 PNG", isOn: $studio.settings.transparent)
+                Text("套用官方透明图格式，输出带透明通道的 PNG，适合做贴纸、图标、抠图素材。").font(.caption).foregroundStyle(.secondary)
+                Toggle("去除 VAE 网格（推荐）", isOn: $studio.settings.degrid)
+                Text("Qwen-Image 的 VAE 会在画面上留下很淡的 2 像素网格，出图后自动精确去除，不影响细节。").font(.caption).foregroundStyle(.secondary)
             }
 
             Section("模型与性能") {
@@ -344,6 +376,8 @@ struct MoreSettings: View {
 struct ChipLook: ViewModifier {
     func body(content: Content) -> some View {
         content
+            .lineLimit(1)
+            .fixedSize()
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
             .background(Capsule().fill(.quaternary.opacity(0.7)))
@@ -353,6 +387,8 @@ struct ChipLook: ViewModifier {
 struct ChipStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
+            .lineLimit(1)
+            .fixedSize()
             .padding(.horizontal, 8)
             .padding(.vertical, 5)
             .background(Capsule().fill(.quaternary.opacity(configuration.isPressed ? 1 : 0.7)))
@@ -368,8 +404,9 @@ struct ChipToggleStyle: ToggleStyle {
         Button { configuration.isOn.toggle() } label: {
             HStack(spacing: 4) {
                 Circle().fill(color).frame(width: 7, height: 7)
-                configuration.label
+                configuration.label.lineLimit(1)
             }
+            .fixedSize()
             .font(.callout.weight(.semibold))
             .foregroundStyle(color)
             .padding(.horizontal, 8)

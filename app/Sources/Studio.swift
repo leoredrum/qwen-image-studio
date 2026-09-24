@@ -188,6 +188,7 @@ final class Studio {
     // MARK: 图片
     func image(_ rel: String) -> NSImage? { NSImage(contentsOf: url(rel)) }
 
+
     func thumbnail(_ rel: String, size: CGFloat = 360) -> NSImage? {
         let key = "\(rel)@\(Int(size))" as NSString
         if let img = thumbCache.object(forKey: key) { return img }
@@ -295,42 +296,108 @@ final class Studio {
             sampler: s.sampler, scheduler: s.scheduler, batch: s.batch,
             diffusionModel: s.diffusionModel, textEncoder: s.textEncoder,
             nsfw: s.nsfw, fastMode: s.fastMode, refImages: effectiveRefs)
-        let chained = chainSource.flatMap { effectiveRefs.first == $0 ? $0 : nil }
         if chainPending { params.chainFrom = chainTarget?.id }
-        let previous = chainTarget?.params.prompt
+        params.transparent = s.transparent
+        params.degrid = s.degrid
+        if s.assistant {
+            // 改写放到真正开始生成时做：那时上一张一定已经画完，改图模型才能看到它
+            params.userText = prompt
+            params.needsRewrite = true
+        }
         draft = ""
         refImages = []
         freshNext = false
-        guard s.assistant else { enqueue(params); return }
+        enqueue(params)
+    }
 
-        // 先交给提示词助手理解上下文，再入队
-        var item = ChatItem(params: params)
-        item.params.userText = prompt
-        item.status = .thinking
-        items.append(item)
-        selectedItemID = item.id
-        selectedOutput = nil
-        let id = item.id
-        Task {
+    // MARK: 提示词助手
+    var peInstalled: Bool {
+        guard let m = ollamaModels else { return false }
+        return Assistant.peModels.values.allSatisfy { m.contains($0) }
+    }
+    var pePull: [String: (Double, String)] = [:]
+    var pePullError: String?
+
+    func installPE() {
+        pePullError = nil
+        for name in Assistant.peModels.values.sorted() where !(ollamaModels ?? []).contains(name) && pePull[name] == nil {
+            pePull[name] = (0, "准备下载")
+            Task {
+                do {
+                    try await Assistant.pull(name) { [weak self] p, status in self?.pePull[name] = (p, status) }
+                } catch {
+                    pePullError = error.localizedDescription
+                }
+                pePull[name] = nil
+                await checkOllama()
+            }
+        }
+    }
+
+    /// 明确要求画全新的图时，不再接着改
+    private static let freshRegex = /(重新画|重画|从头画|画一张新|换一张新|全新的|换个完全|新画一张|start over|new image)/
+
+    private func size(forRatio ratio: String, fallback: (Int, Int)) -> (Int, Int) {
+        let parts = ratio.split(separator: ":").compactMap { Double($0) }
+        guard parts.count == 2, parts[0] > 0, parts[1] > 0 else { return fallback }
+        if let a = Aspect(rawValue: ratio) { return presetSize(a, settings.tier) }
+        return fitSize(aspect: parts[0] / parts[1], megapixels: settings.tier.megapixels)
+    }
+
+    private func imageAspect(_ rel: String) -> Double? {
+        guard let rep = NSImageRep(contentsOf: url(rel)), rep.pixelsHigh > 0 else { return nil }
+        return Double(rep.pixelsWide) / Double(rep.pixelsHigh)
+    }
+
+    /// 生成前改写提示词：装了官方 PE 就用官方的（文生图 / 改图分开，改图时能看到底图），否则用通用模型
+    private func rewrite(_ id: UUID) async {
+        guard let item = items.first(where: { $0.id == id }), item.params.needsRewrite == true else { return }
+        update(id) { $0.status = .thinking; $0.params.needsRewrite = nil }
+        var p = item.params
+        let text = p.userText ?? p.prompt
+        let chainedRef = p.refImages.first.flatMap { r in items.contains { $0.outputs.contains(r) } ? r : nil }
+
+        if chainedRef != nil, text.contains(Self.freshRegex) {
+            p.refImages.removeFirst()
+            p.assistantNote = "你要求画一张新的，这次不基于上一张"
+        }
+
+        if settings.useOfficialPE && peInstalled {
+            let task: Assistant.PETask = p.refImages.isEmpty ? .t2i : .edit
             do {
-                let r = try await Assistant.rewrite(text: prompt, previousPrompt: previous, model: s.assistantModel)
-                update(id) { it in
-                    it.params.prompt = r.prompt
-                    it.params.assistantMode = r.mode
-                    it.params.assistantNote = r.reason
-                    // 用户明确要求画一张全新的：不再以上一张为底图
-                    if r.mode == "generate" {
-                        if let c = chained { it.params.refImages.removeAll { $0 == c } }
-                        it.params.chainFrom = nil
+                let r = try await Assistant.rewriteOfficial(task, text: text, images: p.refImages.map(url), cacheDir: modelsDir.appending(path: "pe"))
+                p.prompt = r.prompt
+                p.assistantMode = task == .t2i ? "generate" : "edit"
+                var note = "官方改写模型 · 思考 \(Int(r.seconds)) 秒"
+                if !settings.customSize && settings.peRatio {
+                    if task == .edit, r.ratioFollow.hasPrefix("<image"),
+                       let n = Int(r.ratioFollow.filter(\.isNumber)), n >= 1, n <= p.refImages.count,
+                       let a = imageAspect(p.refImages[n - 1]) {
+                        (p.width, p.height) = fitSize(aspect: a, megapixels: settings.tier.megapixels)
+                        note += " · 尺寸跟随第 \(n) 张参考图"
+                    } else if !r.whRatio.isEmpty {
+                        (p.width, p.height) = size(forRatio: r.whRatio, fallback: (p.width, p.height))
+                        note += " · 比例 \(r.whRatio)"
                     }
                 }
+                if let old = p.assistantNote { note = old + "；" + note }
+                p.assistantNote = note
             } catch {
-                update(id) { $0.params.assistantNote = "助手不可用，已按原话生成：\(error.localizedDescription)" }
+                p.assistantNote = "官方改写失败，已按原话生成：\(error.localizedDescription)"
             }
-            update(id) { if $0.status == .thinking { $0.status = .queued } }
-            saveHistory()
-            pump()
+        } else {
+            let previous = chainedRef.flatMap { r in items.first { $0.outputs.contains(r) }?.params.prompt }
+            do {
+                let r = try await Assistant.rewrite(text: text, previousPrompt: p.refImages.isEmpty ? nil : previous, model: settings.assistantModel)
+                p.prompt = r.prompt
+                p.assistantMode = r.mode
+                p.assistantNote = r.reason
+                if r.mode == "generate", let c = chainedRef { p.refImages.removeAll { $0 == c } }
+            } catch {
+                p.assistantNote = "助手不可用，已按原话生成：\(error.localizedDescription)"
+            }
         }
+        update(id) { $0.params = p }
     }
 
     func enqueue(_ params: GenParams) {
@@ -372,7 +439,12 @@ final class Studio {
         }
     }
 
-    func cancel() { engine.cancel() }
+    @ObservationIgnored private var cancelRequested = false
+
+    func cancel() {
+        cancelRequested = true
+        engine.cancel()
+    }
 
     /// 严格按对话顺序执行：前面还有在理解中的，就先等它，保证「接着改」拿到的是上一轮的结果
     private func pump() {
@@ -396,9 +468,23 @@ final class Studio {
                 if let base, !it.params.refImages.contains(base) { it.params.refImages.insert(base, at: 0) }
             }
         }
-        guard let item = items.first(where: { $0.id == id }) else { return }
-        let p = item.params
         runningID = id
+        cancelRequested = false
+        await rewrite(id)
+        if cancelRequested {
+            update(id) { $0.status = .cancelled }
+            runningID = nil
+            saveHistory()
+            pump()
+            return
+        }
+        guard var p = items.first(where: { $0.id == id })?.params else { runningID = nil; return }
+        // 透明背景：套用官方推荐的提示词格式
+        if p.transparent == true && !p.prompt.hasPrefix("This is an RGBA image") {
+            p.prompt = "This is an RGBA image with transparency. \(p.prompt) The image has alpha channel and the background is transparent."
+            let final = p
+            update(id) { $0.params = final }
+        }
         progress = RunProgress(imageCount: p.batch)
         previewImage = nil
         logTail = []
@@ -438,12 +524,20 @@ final class Studio {
         let code = await engine.run(executable: sdCLI, args: args, cwd: root) { [weak self] line in
             self?.handle(line)
         }
-        let cancelled = engine.cancelled
+        let cancelled = engine.cancelled || cancelRequested
 
         let files = ((try? FileManager.default.contentsOfDirectory(atPath: outputsDir.path)) ?? [])
             .filter { $0.hasPrefix(prefix) && $0.hasSuffix(".png") }
             .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
         try? FileManager.default.removeItem(at: preview)
+
+        // 去除 VAE 留下的 2px 网格
+        if p.degrid == true && !cancelled {
+            progress.stage = "去网格"
+            let urls = files.map(url)
+            await Task.detached { for u in urls { DeGrid.process(url: u) } }.value
+            thumbCache.removeAllObjects()
+        }
 
         let dur = Date().timeIntervalSince(start)
         let speed = progress.secPerStep

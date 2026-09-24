@@ -126,6 +126,10 @@ struct Settings: Codable, Equatable {
     var chainEdits = true
     var assistant = true
     var assistantModel = "qwen3.5:9b"
+    var useOfficialPE = true
+    var peRatio = true
+    var degrid = true
+    var transparent = false
 
     static let key = "studio.settings"
 
@@ -158,6 +162,10 @@ struct Settings: Codable, Equatable {
         chainEdits = v(.chainEdits, d.chainEdits)
         assistant = v(.assistant, d.assistant)
         assistantModel = v(.assistantModel, d.assistantModel)
+        useOfficialPE = v(.useOfficialPE, d.useOfficialPE)
+        peRatio = v(.peRatio, d.peRatio)
+        degrid = v(.degrid, d.degrid)
+        transparent = v(.transparent, d.transparent)
     }
 
     static func load() -> Settings {
@@ -193,6 +201,9 @@ struct GenParams: Codable, Hashable {
     var assistantMode: String?   // generate | edit
     var assistantNote: String?   // 助手的判断理由或错误信息
     var chainFrom: UUID?         // 发送时上一轮还没画完：等它完成后以它的结果为底图
+    var needsRewrite: Bool?      // 开始生成前交给助手改写
+    var transparent: Bool?       // 透明背景 PNG
+    var degrid: Bool?            // 出图后去除 VAE 网格
 
     var modelShortName: String {
         diffusionModel.replacingOccurrences(of: "qwen-image-2.1-", with: "").replacingOccurrences(of: ".gguf", with: "")

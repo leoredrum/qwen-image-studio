@@ -1,4 +1,4 @@
-import Foundation
+import AppKit
 
 /// 提示词助手：用本地 Ollama 理解对话上下文，决定「重画」还是「局部修改」，并改写成图像模型易懂的正面描述
 enum Assistant {
@@ -62,6 +62,129 @@ enum Assistant {
         }
         let content = try JSONDecoder().decode(Reply.self, from: data).message.content
         return try JSONDecoder().decode(Result.self, from: Data(content.utf8))
+    }
+
+    // MARK: - 官方提示词改写模型（Qwen-Image-2.1-PE）
+
+    enum PETask: String { case t2i, edit }
+
+    static let peModels: [PETask: String] = [
+        .t2i: "hf.co/prithivMLmods/Qwen-Image-2.1-PE-T2I-GGUF:Q4_K_M",
+        .edit: "hf.co/prithivMLmods/Qwen-Image-2.1-PE-I2I-GGUF:Q4_K_M",
+    ]
+
+    /// 官方 system prompt（Qwen Research License），首次使用时从官方仓库下载并缓存
+    static func peSystemPrompt(_ task: PETask, cacheDir: URL) async throws -> String {
+        let name = task == .t2i ? "system_prompt_t2i.txt" : "system_prompt_edit.txt"
+        let local = cacheDir.appending(path: name)
+        if let s = try? String(contentsOf: local, encoding: .utf8), !s.isEmpty { return s }
+        let url = URL(string: "https://raw.githubusercontent.com/QwenLM/Qwen-Image-2.1/main/prompt_rewrite/prompts/\(name)")!
+        let (data, resp) = try await URLSession.shared.data(from: url)
+        guard (resp as? HTTPURLResponse)?.statusCode == 200, let s = String(data: data, encoding: .utf8) else {
+            throw NSError(domain: "Assistant", code: 2, userInfo: [NSLocalizedDescriptionKey: "无法下载官方 system prompt"])
+        }
+        try? FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
+        try? data.write(to: local)
+        return s
+    }
+
+    struct PEResult {
+        var prompt: String
+        var whRatio: String       // 例如 "3:2"，为空表示没指定
+        var ratioFollow: String   // 例如 "<image1>"，仅改图
+        var seconds: Double
+    }
+
+    /// 按官方参数调用：开启思考，temperature 1.0，top_p 0.95；图片按训练时的上限缩到 1MP 以内，放在文字前面
+    static func rewriteOfficial(_ task: PETask, text: String, images: [URL], cacheDir: URL) async throws -> PEResult {
+        let system = try await peSystemPrompt(task, cacheDir: cacheDir)
+        var user: [String: Any] = ["role": "user", "content": text]
+        if task == .edit { user["images"] = images.compactMap(encodeImage) }
+        var options: [String: Any] = ["temperature": 1.0, "top_p": 0.95, "top_k": 20, "num_ctx": 16384, "num_predict": 8192]
+        if task == .t2i { options["presence_penalty"] = 1.5 }
+        let body: [String: Any] = [
+            "model": peModels[task]!,
+            "stream": false,
+            "think": true,
+            "keep_alive": "30m",
+            "options": options,
+            "messages": [["role": "system", "content": system], user],
+        ]
+        var req = URLRequest(url: endpoint.appending(path: "api/chat"))
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        req.timeoutInterval = 600
+
+        let start = Date()
+        struct Reply: Decodable { struct Msg: Decodable { let content: String; let thinking: String? }; let message: Msg }
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard (resp as? HTTPURLResponse)?.statusCode == 200 else {
+            throw NSError(domain: "Assistant", code: 1, userInfo: [NSLocalizedDescriptionKey: String(data: data, encoding: .utf8) ?? "Ollama 返回错误"])
+        }
+        let msg = try JSONDecoder().decode(Reply.self, from: data).message
+        // 有的模板不拆分思考内容，这里兼容 </think> 混在正文里的情况
+        var answer = msg.content
+        if let r = answer.range(of: "</think>") { answer = String(answer[r.upperBound...]) }
+        guard let obj = lastJSONObject(in: answer),
+              let prompt = (obj["rewritten_prompt"] ?? obj["rewrited_prompt"]) as? String,
+              !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw NSError(domain: "Assistant", code: 3, userInfo: [NSLocalizedDescriptionKey: "官方改写模型没有返回有效结果"])
+        }
+        return PEResult(prompt: prompt.trimmingCharacters(in: .whitespacesAndNewlines),
+                        whRatio: (obj["wh_ratio"] as? String ?? "").trimmingCharacters(in: .whitespaces),
+                        ratioFollow: (obj["ratio_follow"] as? String ?? "").trimmingCharacters(in: .whitespaces),
+                        seconds: Date().timeIntervalSince(start))
+    }
+
+    /// 从回答里找最后一个能解析的 JSON 对象
+    static func lastJSONObject(in text: String) -> [String: Any]? {
+        let chars = Array(text)
+        var ends: [Int] = []
+        for (i, c) in chars.enumerated() where c == "}" { ends.append(i) }
+        for end in ends.reversed() {
+            var depth = 0
+            var i = end
+            while i >= 0 {
+                if chars[i] == "}" { depth += 1 } else if chars[i] == "{" { depth -= 1; if depth == 0 { break } }
+                i -= 1
+            }
+            guard i >= 0 else { continue }
+            let candidate = String(chars[i...end])
+            if let d = candidate.data(using: .utf8), let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any] { return obj }
+        }
+        return nil
+    }
+
+    /// 缩到 1MP 以内，转 JPEG 后 base64
+    static func encodeImage(_ url: URL) -> String? {
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+              let w = props[kCGImagePropertyPixelWidth] as? Int, let h = props[kCGImagePropertyPixelHeight] as? Int else { return nil }
+        let scale = min(1, (1_048_576 / Double(w * h)).squareRoot())
+        let maxSide = Int(Double(max(w, h)) * scale)
+        guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxSide,
+        ] as CFDictionary) else { return nil }
+        let rep = NSBitmapImageRep(cgImage: cg)
+        return rep.representation(using: .jpeg, properties: [.compressionFactor: 0.92])?.base64EncodedString()
+    }
+
+    /// Ollama 拉取模型（流式进度）
+    static func pull(_ name: String, progress: @escaping @MainActor (Double, String) -> Void) async throws {
+        var req = URLRequest(url: endpoint.appending(path: "api/pull"))
+        req.httpMethod = "POST"
+        req.httpBody = try JSONSerialization.data(withJSONObject: ["model": name, "stream": true])
+        req.timeoutInterval = 3600
+        let (bytes, _) = try await URLSession.shared.bytes(for: req)
+        for try await line in bytes.lines {
+            guard let d = line.data(using: .utf8), let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { continue }
+            if let err = obj["error"] as? String { throw NSError(domain: "Assistant", code: 4, userInfo: [NSLocalizedDescriptionKey: err]) }
+            let status = obj["status"] as? String ?? ""
+            let total = (obj["total"] as? Double) ?? 0, done = (obj["completed"] as? Double) ?? 0
+            await progress(total > 0 ? done / total : 0, status)
+        }
     }
 
     static func models() async -> [String] {

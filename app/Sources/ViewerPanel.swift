@@ -42,6 +42,7 @@ struct ViewerPanel: View {
                     .resizable()
                     .interpolation(.high)
                     .scaledToFit()
+                    .background { if studio.selectedItem?.params.transparent == true { Checkerboard() } }
                     .clipShape(RoundedRectangle(cornerRadius: 6))
                     .shadow(color: .black.opacity(0.25), radius: 16, y: 6)
                     .padding(28)
@@ -159,6 +160,20 @@ struct ViewerPanel: View {
         Button("复制图片") { studio.copyImage(rel) }
         Button("另存为…") { studio.saveAs(rel) }
         Button("在 Finder 中显示") { studio.revealInFinder(rel) }
+    }
+}
+
+/// 透明图下方的棋盘格
+struct Checkerboard: View {
+    var cell: CGFloat = 12
+    var body: some View {
+        Canvas { ctx, size in
+            ctx.fill(Path(CGRect(origin: .zero, size: size)), with: .color(Color(white: 0.92)))
+            let cols = Int(size.width / cell) + 1, rows = Int(size.height / cell) + 1
+            for r in 0..<rows { for c in 0..<cols where (r + c) % 2 == 1 {
+                ctx.fill(Path(CGRect(x: CGFloat(c) * cell, y: CGFloat(r) * cell, width: cell, height: cell)), with: .color(Color(white: 0.78)))
+            } }
+        }
     }
 }
 
