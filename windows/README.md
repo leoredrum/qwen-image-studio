@@ -11,10 +11,13 @@ Qt for Python，并通过 `stable-diffusion.cpp` 的 `sd-cli.exe` 完成本地�
 ## 已实现
 
 - 对话式生图、生成队列、进度、剩余时间和实时预览
-- 以上一张结果继续修改，也可加入最多 10 张参考图
+- **接着改**：同一段对话里默认以上一张为底图继续修改；上一张还在生成时发的话，会等它画完再接着改；「画新图」只对下一次生效
+- 也可加入最多 10 张参考图
+- **Qwen 官方提示词改写模型**（PE-T2I / PE-I2I，经 Ollama 运行）：文生图时扩写成详细描述并自动选画面比例；改图时模型能看到上一张图
+- **去除 VAE 网格**：出图后自动精确去除 Qwen-Image VAE 留下的 2px 网格
 - 草稿 / 标准 / 2K 三档分辨率与 7 种画面比例
 - 步数、CFG、采样器、调度器、Seed、批量、负面提示词
-- EasyCache、VAE 分块解码、透明背景提示词格式
+- EasyCache、VAE 分块解码、透明背景 PNG（预览带棋盘格）
 - 本地历史记录、复制、另存、打开位置、复用为参考图
 - 内置模型管理器：按内存推荐量化档位，并从 Hugging Face 下载
 - 可选 Ollama 提示词助手；Ollama 不可用时自动按原提示词生成
@@ -120,15 +123,18 @@ Qwen Image Studio\
 
 工作目录可在“设置 → 存储”中修改。
 
-## Ollama 提示词助手
+## 提示词助手（Ollama）
 
-安装并启动 [Ollama](https://ollama.com/)，然后准备一个本地模型，例如：
+安装并启动 [Ollama](https://ollama.com/)，然后在“设置 → 高级 → 提示词助手”里点「安装 Qwen 官方改写模型」（约 12GB），也可以在终端手动下载：
 
 ```powershell
-ollama pull qwen3.5:9b
+ollama pull hf.co/prithivMLmods/Qwen-Image-2.1-PE-T2I-GGUF:Q4_K_M
+ollama pull hf.co/prithivMLmods/Qwen-Image-2.1-PE-I2I-GGUF:Q4_K_M
 ```
 
-在“设置 → 高级”中填写模型名，并在输入框下勾选“助手”。助手会根据上一张图片的提示词判断是继续改图还是新画。没有运行 Ollama 时，生成不会中断，只会回退到用户原话。
+装好后，输入框下勾选“助手”即可：发送后先由官方模型思考再改写（文生图约 30 秒，改图约 1~1.5 分钟），改图时它能看到上一张图。官方 system prompt 采用 Qwen Research License，首次使用时从官方仓库下载并缓存到 `models\pe\`。
+
+没装官方模型时，会使用“通用模型（备用）”里填写的任意 Ollama 模型（例如 `qwen3.5:9b`）。没有运行 Ollama 时，生成不会中断，只会回退到用户原话。
 
 ## 测试
 

@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qwen-image-studio-windows"
-version = "1.0.0"
+version = "1.3.0"
 description = "Native Windows desktop UI for local Qwen-Image-2.1 generation and editing"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-dependencies = ["PySide6>=6.8,<7"]
+dependencies = ["PySide6>=6.8,<7", "numpy>=2.0,<3"]
 
 [project.scripts]
 qwen-image-studio = "qwen_studio.app:main"

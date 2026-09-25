@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import re
 import shutil
 import uuid
 from dataclasses import asdict, dataclass, field, fields
@@ -167,6 +168,9 @@ class Settings:
     assistant_model: str = "qwen3.5:9b"
     transparent: bool = False
     backend: str = "自动"
+    use_official_pe: bool = True
+    pe_ratio: bool = True
+    degrid: bool = True
 
     @classmethod
     def load(cls, path: Path) -> "Settings":
@@ -205,6 +209,10 @@ class GenerationParams:
     easy_cache: bool = False
     transparent: bool = False
     user_text: str | None = None
+    needs_rewrite: bool = False      # 开始生成前交给助手改写
+    assistant_mode: str | None = None  # generate | edit
+    chain_from: str | None = None    # 发送时上一轮还没画完：等它完成后以它的结果为底图
+    degrid: bool = False             # 出图后去除 VAE 网格
 
 
 @dataclass(slots=True)
@@ -224,7 +232,8 @@ class GenerationItem:
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "GenerationItem":
-        params = GenerationParams(**raw.pop("params"))
+        known = {f.name for f in fields(GenerationParams)}
+        params = GenerationParams(**{k: v for k, v in raw.pop("params").items() if k in known})
         valid = {f.name for f in fields(cls)}
         item = cls(params=params, **{k: v for k, v in raw.items() if k in valid and k != "params"})
         if item.status in {"queued", "running", "thinking"}:
@@ -341,3 +350,73 @@ def build_sd_args(params: GenerationParams, paths: AppPaths, model_state: dict[s
     elif backend == "vulkan":
         args += ["--backend", "vulkan0"]
     return args
+
+
+# --------------------------------------------------------------------------- #
+# 连续修改、官方改写结果处理
+# --------------------------------------------------------------------------- #
+
+PENDING = {"thinking", "queued", "running"}
+
+#: 明确要求画全新的图时，不再接着改
+FRESH_RE = re.compile(r"(重新画|重画|从头画|画一张新|换一张新|全新的|换个完全|新画一张|start over|new image)", re.IGNORECASE)
+
+
+def chain_target(items: list[GenerationItem], selected: GenerationItem | None, fresh_next: bool) -> GenerationItem | None:
+    """「接着改」的目标轮次：右侧选中的那一轮（已完成或还在生成），否则是对话里最近完成的一轮。"""
+    if fresh_next:
+        return None
+    if selected is not None and ((selected.status == "done" and selected.outputs) or selected.status in PENDING):
+        return selected
+    return next((i for i in reversed(items) if i.status == "done" and i.outputs), None)
+
+
+def size_for_ratio(ratio: str, tier: str, fallback: tuple[int, int]) -> tuple[int, int]:
+    """把 "W:H" 换算成当前分辨率档位下的尺寸；是预设比例时用官方预设尺寸。"""
+    try:
+        w, h = (float(x) for x in ratio.split(":"))
+    except ValueError:
+        return fallback
+    if w <= 0 or h <= 0:
+        return fallback
+    if ratio in ASPECTS:
+        return preset_size(ratio, tier)
+    return fit_size(w / h, SIZE_TIERS.get(tier, 1.05))
+
+
+def last_json_object(text: str) -> dict[str, Any] | None:
+    """从回答里找最后一个能解析的 JSON 对象（官方模型把答案放在最后）。"""
+    ends = [i for i, c in enumerate(text) if c == "}"]
+    for end in reversed(ends):
+        depth = 0
+        for start in range(end, -1, -1):
+            if text[start] == "}":
+                depth += 1
+            elif text[start] == "{":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        obj = json.loads(text[start:end + 1])
+                    except json.JSONDecodeError:
+                        break
+                    if isinstance(obj, dict):
+                        return obj
+                    break
+    return None
+
+
+def parse_pe_answer(answer: str) -> dict[str, str] | None:
+    """解析官方改写模型的回答，返回 {prompt, wh_ratio, ratio_follow}。"""
+    if "</think>" in answer:
+        answer = answer.split("</think>", 1)[1]
+    obj = last_json_object(answer)
+    if not obj:
+        return None
+    prompt = obj.get("rewritten_prompt") or obj.get("rewrited_prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return None
+    return {
+        "prompt": prompt.strip(),
+        "wh_ratio": str(obj.get("wh_ratio") or "").strip(),
+        "ratio_follow": str(obj.get("ratio_follow") or "").strip(),
+    }

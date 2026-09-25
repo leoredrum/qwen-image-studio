@@ -1,5 +1,5 @@
 ﻿#define MyAppName "Qwen Image Studio"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.3.0"
 #define MyAppExeName "Qwen Image Studio.exe"
 
 [Setup]

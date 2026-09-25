@@ -12,7 +12,7 @@
 <p align="center">
   <a href="../../releases/latest"><b>⬇️ macOS 版（DMG）</b></a>
   &nbsp;·&nbsp;
-  <a href="../../releases/tag/windows-v1.0.0"><b>⬇️ Windows 版（绿色版 zip）</b></a>
+  <a href="../../releases/latest"><b>⬇️ Windows 版（绿色版 zip）</b></a>
 </p>
 
 ![screenshot](docs/screenshot.png)
@@ -55,14 +55,14 @@
 
 [`windows/`](windows/) 目录是 Windows 10/11 版本（Qt for Python + stable-diffusion.cpp），支持 NVIDIA（CUDA）、AMD / Intel（Vulkan）和 CPU 三种推理后端。
 
-1. 从 [Releases](../../releases/tag/windows-v1.0.0) 下载 `Qwen-Image-Studio-Windows-1.0.0-portable.zip` 并解压
+1. 从 [Releases](../../releases/latest) 下载 `Qwen-Image-Studio-Windows-<版本>-portable.zip` 并解压
 2. 在解压出的文件夹里打开 PowerShell，下载推理引擎（AMD / Intel 显卡把 `CUDA` 换成 `Vulkan`）：
    ```powershell
    powershell -ExecutionPolicy Bypass -File .\scripts\download-engine.ps1 -Backend CUDA
    ```
 3. 启动 `Qwen Image Studio.exe`，点「模型」→「一键安装推荐组合」
 
-Windows 版目前还没有官方提示词改写、VAE 去网格和「画新图只生效一次」这几项功能。详见 [windows/README.md](windows/README.md)。
+功能与 macOS 版一致（包括官方提示词改写、VAE 去网格、接着改）。详见 [windows/README.md](windows/README.md)。
 
 ## 从源码构建
 

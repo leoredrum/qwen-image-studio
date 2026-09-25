@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, QSize, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QDesktopServices, QIcon, QImageReader, QKeyEvent, QPixmap
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QIcon, QImageReader, QKeyEvent, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
@@ -20,12 +20,12 @@ from PySide6.QtWidgets import (
     QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
-from . import assistant
+from . import assistant, degrid
 from .core import (
-    ASPECTS, DIFFUSION_MODELS, QUALITY_PRESETS, SAFETY_NEGATIVE, SAMPLERS, SCHEDULERS, SIZE_TIERS,
-    SUPPORT_MODELS, AppPaths, GenerationItem, GenerationParams, HistoryStore, ModelFile,
-    Settings, build_sd_args, fit_size, import_reference, physical_memory_gb, recommended_diffusion,
-    scan_models,
+    ASPECTS, DIFFUSION_MODELS, FRESH_RE, PENDING, QUALITY_PRESETS, SAFETY_NEGATIVE, SAMPLERS, SCHEDULERS,
+    SIZE_TIERS, SUPPORT_MODELS, AppPaths, GenerationItem, GenerationParams, HistoryStore, ModelFile,
+    Settings, build_sd_args, chain_target, fit_size, import_reference, physical_memory_gb,
+    recommended_diffusion, scan_models, size_for_ratio,
 )
 from .downloader import DownloadThread
 from .engine import EngineThread
@@ -75,18 +75,43 @@ class PromptEdit(QPlainTextEdit):
 
 
 class RewriteThread(QThread):
-    completed = Signal(str, str, str)
+    """生成前改写提示词：装了官方 PE 就用官方的（改图时能看到底图），否则用通用模型。"""
+    completed = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, text: str, previous_prompt: str | None, model: str):
+    def __init__(self, job: dict):
         super().__init__()
-        self.text, self.previous_prompt, self.model = text, previous_prompt, model
+        self.job = job
+
+    def run(self) -> None:
+        job = self.job
+        try:
+            if job["official"]:
+                result = assistant.rewrite_official(job["task"], job["text"], job["images"], job["cache_dir"])
+                result.update(official=True, task=job["task"])
+            else:
+                mode, prompt, reason = assistant.rewrite(job["text"], job["previous"], job["model"])
+                result = {"official": False, "mode": mode, "prompt": prompt, "reason": reason}
+            self.completed.emit(result)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class PullThread(QThread):
+    """通过 Ollama 下载官方改写模型。"""
+    progress = Signal(str, float, str)
+    finished_with = Signal(str, str)  # 模型名, 错误信息（成功为空）
+
+    def __init__(self, name: str):
+        super().__init__()
+        self.name = name
 
     def run(self) -> None:
         try:
-            self.completed.emit(*assistant.rewrite(self.text, self.previous_prompt, self.model))
+            assistant.pull(self.name, lambda p, status: self.progress.emit(self.name, p, status))
+            self.finished_with.emit(self.name, "")
         except Exception as exc:
-            self.failed.emit(str(exc))
+            self.finished_with.emit(self.name, str(exc))
 
 
 class ImageLabel(QLabel):
@@ -97,9 +122,11 @@ class ImageLabel(QLabel):
         self.setStyleSheet("background:#171717; color:#777; border-radius:12px;")
         self._source: Path | None = None
         self._pixmap: QPixmap | None = None
+        self._transparent = False
 
-    def set_image(self, path: Path | None) -> None:
+    def set_image(self, path: Path | None, transparent: bool = False) -> None:
         self._source = path
+        self._transparent = transparent
         self._pixmap = QPixmap(str(path)) if path and path.exists() else None
         self._refresh()
 
@@ -109,7 +136,19 @@ class ImageLabel(QLabel):
 
     def _refresh(self) -> None:
         if self._pixmap and not self._pixmap.isNull():
-            self.setPixmap(self._pixmap.scaled(self.size() - QSize(20, 20), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            scaled = self._pixmap.scaled(self.size() - QSize(20, 20), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            if self._transparent:
+                # 透明图下面垫棋盘格，看得出哪里是透明的
+                board = QPixmap(scaled.size())
+                painter = QPainter(board)
+                cell = 12
+                for y in range(0, board.height(), cell):
+                    for x in range(0, board.width(), cell):
+                        painter.fillRect(x, y, cell, cell, QColor(200, 200, 200) if (x // cell + y // cell) % 2 else QColor(235, 235, 235))
+                painter.drawPixmap(0, 0, scaled)
+                painter.end()
+                scaled = board
+            self.setPixmap(scaled)
             self.setText("")
         else:
             self.setPixmap(QPixmap())
@@ -167,14 +206,32 @@ class SettingsDialog(QDialog):
         page.setLayout(layout)
         self.live_preview = QCheckBox("生成过程中显示实时预览"); self.live_preview.setChecked(self.settings.live_preview)
         self.vae_tiling = QCheckBox("VAE 分块解码（高分辨率推荐）"); self.vae_tiling.setChecked(self.settings.vae_tiling)
-        self.chain = QCheckBox("默认以上一张图片继续修改"); self.chain.setChecked(self.settings.chain_edits)
+        self.degrid = QCheckBox("去除 VAE 网格（推荐，出图后自动精确去除 2px 网格）"); self.degrid.setChecked(self.settings.degrid)
         self.nsfw = QCheckBox("允许成人内容（不附加安全负面提示词）"); self.nsfw.setChecked(self.settings.allow_nsfw)
         self.backend = QComboBox(); self.backend.addItems(["自动", "CUDA", "Vulkan", "CPU"]); self.backend.setCurrentText(self.settings.backend)
-        self.assistant_model = QLineEdit(self.settings.assistant_model)
-        for widget in (self.live_preview, self.vae_tiling, self.chain, self.nsfw):
+        for widget in (self.live_preview, self.vae_tiling, self.degrid, self.nsfw):
             layout.addWidget(widget)
-        form = QFormLayout(); form.addRow("推理后端", self.backend); form.addRow("Ollama 模型", self.assistant_model)
-        layout.addLayout(form); layout.addStretch()
+        form = QFormLayout(); form.addRow("推理后端", self.backend)
+        layout.addLayout(form)
+
+        group = QGroupBox("提示词助手（本地 Ollama）")
+        box = QVBoxLayout(group)
+        models = assistant.list_models()
+        installed = assistant.pe_installed(models)
+        status = ("已安装 Qwen 官方改写模型" if installed else "未安装官方改写模型") if models else "未检测到 Ollama（ollama.com）"
+        box.addWidget(QLabel(status))
+        self.use_pe = QCheckBox("使用官方改写模型（推荐）：改图时能看到上一张图"); self.use_pe.setChecked(self.settings.use_official_pe)
+        self.pe_ratio = QCheckBox("让助手决定画面比例"); self.pe_ratio.setChecked(self.settings.pe_ratio)
+        box.addWidget(self.use_pe); box.addWidget(self.pe_ratio)
+        if models and not installed:
+            install = QPushButton("安装 Qwen 官方改写模型（约 12GB）")
+            install.clicked.connect(lambda: (self.parent().install_pe(), install.setEnabled(False), install.setText("已开始下载，进度见主窗口底部状态栏")))
+            box.addWidget(install)
+        self.assistant_model = QLineEdit(self.settings.assistant_model)
+        general = QFormLayout(); general.addRow("通用模型（备用）", self.assistant_model); box.addLayout(general)
+        hint = QLabel("官方模型会先思考再改写：文生图约 30 秒，改图约 1~1.5 分钟。没装官方模型时，使用上面的通用模型。")
+        hint.setObjectName("muted"); hint.setWordWrap(True); box.addWidget(hint)
+        layout.addWidget(group); layout.addStretch()
         return page
 
     def _storage_tab(self) -> QWidget:
@@ -201,7 +258,8 @@ class SettingsDialog(QDialog):
         s.scheduler = "" if self.scheduler.currentText() == "自动" else self.scheduler.currentText()
         s.batch, s.random_seed, s.seed = self.batch.value(), self.random_seed.isChecked(), self.seed.value()
         s.negative = self.negative.toPlainText().strip()
-        s.live_preview, s.vae_tiling, s.chain_edits = self.live_preview.isChecked(), self.vae_tiling.isChecked(), self.chain.isChecked()
+        s.live_preview, s.vae_tiling, s.degrid = self.live_preview.isChecked(), self.vae_tiling.isChecked(), self.degrid.isChecked()
+        s.use_official_pe, s.pe_ratio = self.use_pe.isChecked(), self.pe_ratio.isChecked()
         s.allow_nsfw, s.backend, s.assistant_model = self.nsfw.isChecked(), self.backend.currentText(), self.assistant_model.text().strip()
         s.root = self.root_edit.text()
         self.accept()
@@ -346,6 +404,9 @@ class MainWindow(QMainWindow):
         self.running_item: GenerationItem | None = None
         self.log_lines: list[str] = []
         self._last_preview = 0.0
+        self.fresh_next = False          # 只对下一次发送生效：不接着改，重新画一张
+        self.cancel_requested = False
+        self.pull_threads: dict[str, PullThread] = {}
         self.setWindowTitle("Qwen Image Studio · Windows")
         self.setMinimumSize(1120, 720)
         self.resize(1380, 880)
@@ -392,9 +453,12 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.problem); layout.addWidget(self.history_list, 1)
         box = QFrame(); box.setStyleSheet("QFrame{background:#292a2d;border:1px solid #3c4043;border-radius:14px;}")
         composer = QVBoxLayout(box)
-        self.chain_label = QLabel("基于右侧图片接着修改"); self.chain_label.setObjectName("muted")
+        self.chain_label = QLabel(); self.chain_label.setObjectName("muted")
+        self.fresh_button = QPushButton("画新图"); self.fresh_button.clicked.connect(self._toggle_fresh)
+        self.fresh_button.setToolTip("下一次不基于上一张，重新画一张全新的（只对下一次生效）")
+        chain_row = QHBoxLayout(); chain_row.addWidget(self.chain_label, 1); chain_row.addWidget(self.fresh_button)
         self.prompt = PromptEdit(); self.prompt.setPlaceholderText("描述你想生成的画面…（Enter 生成，Shift+Enter 换行）"); self.prompt.setMaximumHeight(120); self.prompt.submit.connect(self.send)
-        composer.addWidget(self.chain_label); composer.addWidget(self.prompt)
+        composer.addLayout(chain_row); composer.addWidget(self.prompt)
         self.refs_list = QListWidget(); self.refs_list.setViewMode(QListWidget.IconMode); self.refs_list.setFlow(QListWidget.LeftToRight); self.refs_list.setMaximumHeight(76); self.refs_list.setIconSize(QSize(54, 54)); self.refs_list.hide(); composer.addWidget(self.refs_list)
         controls = QHBoxLayout()
         add_ref = QPushButton("＋ 参考图"); add_ref.clicked.connect(self.add_references)
@@ -477,7 +541,8 @@ class MainWindow(QMainWindow):
 
     def _show_item(self, item: GenerationItem | None) -> None:
         path = self.paths.outputs / item.outputs[0] if item and item.outputs else None
-        self.image.set_image(path)
+        self.image.set_image(path, bool(item and item.params.transparent))
+        self._update_chain_ui()
         if not item:
             self.meta.setText("选择一条历史记录查看详情"); self.note.clear(); return
         p = item.params
@@ -485,7 +550,30 @@ class MainWindow(QMainWindow):
         duration = f" · 用时 {int(item.duration)} 秒" if item.duration else ""
         self.meta.setText(f"{prompt}\n{p.width}×{p.height} · {p.steps}步 · CFG {p.cfg:g} · {p.sampler} · seed {p.seed}{duration}")
         self.note.setText(item.assistant_note or item.error or "")
-        self.chain_label.setText("基于右侧图片接着修改" if item.outputs and self.settings_data.chain_edits else "生成一张新图片")
+
+    # ------------------------------------------------------------------ #
+    # 连续修改：同一段对话里默认接着改上一张，「画新图」只生效一次
+    # ------------------------------------------------------------------ #
+    def _chain_target(self) -> GenerationItem | None:
+        return chain_target(self.items, self.selected_item, self.fresh_next)
+
+    def _update_chain_ui(self) -> None:
+        target = self._chain_target()
+        if target:
+            text = (target.params.user_text or target.params.prompt).replace("\n", " ")
+            state = "等上一张画完后接着改" if target.status in PENDING else "接着改这张"
+            self.chain_label.setText(f"🔗 {state}：{text[:40]}{'…' if len(text) > 40 else ''}")
+            self.fresh_button.setText("画新图"); self.fresh_button.show()
+        elif self.fresh_next:
+            self.chain_label.setText("下一张将重新画")
+            self.fresh_button.setText("撤销，接着改"); self.fresh_button.show()
+        else:
+            self.chain_label.setText("描述一个新画面开始生成")
+            self.fresh_button.hide()
+
+    def _toggle_fresh(self) -> None:
+        self.fresh_next = not self.fresh_next
+        self._update_chain_ui()
 
     def add_references(self) -> None:
         files, _ = QFileDialog.getOpenFileNames(self, "选择参考图（最多 10 张）", "", "图片 (*.png *.jpg *.jpeg *.webp *.bmp)")
@@ -508,9 +596,14 @@ class MainWindow(QMainWindow):
         if model != "未安装模型": self.settings_data.diffusion_model = model
         width, height = self.settings_data.target_size()
         refs = list(self.references)
-        if self.settings_data.chain_edits and self.selected_item and self.selected_item.outputs:
-            current = self.selected_item.outputs[0]
-            if current not in refs: refs.insert(0, current)
+        target = self._chain_target()
+        chain_from = None
+        if target and target.status in PENDING:
+            chain_from = target.id  # 上一轮还没画完：开始生成时再取它的结果
+            if self.settings_data.follow_reference_size and not self.settings_data.custom_size:
+                width, height = target.params.width, target.params.height
+        elif target and target.outputs[0] not in refs:
+            refs.insert(0, target.outputs[0])
         if self.settings_data.follow_reference_size and refs and not self.settings_data.custom_size:
             size = QImageReader(str(self.paths.outputs / refs[0])).size()
             if size.isValid() and size.height() > 0:
@@ -520,8 +613,10 @@ class MainWindow(QMainWindow):
             negative = f"{negative}, {SAFETY_NEGATIVE}" if negative else SAFETY_NEGATIVE
         encoders = list(self.model_state["encoder"] or [])
         encoder = self.settings_data.text_encoder if self.settings_data.text_encoder in encoders else (encoders[0] if encoders else self.settings_data.text_encoder)
+        assist = self.assistant_check.isChecked()
         return GenerationParams(
-            prompt=text, user_text=text if self.assistant_check.isChecked() else None,
+            prompt=text, user_text=text if assist else None, needs_rewrite=assist, chain_from=chain_from,
+            degrid=self.settings_data.degrid,
             negative=negative, width=width, height=height, steps=self.settings_data.steps,
             cfg=self.settings_data.cfg, seed=random.randint(0, 2_147_483_647) if self.settings_data.random_seed else self.settings_data.seed,
             sampler=self.settings_data.sampler, scheduler=self.settings_data.scheduler,
@@ -538,35 +633,81 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "尚未就绪", self.problem.text()); return
         self.settings_data.assistant = self.assistant_check.isChecked()
         item = GenerationItem(params=self._make_params(text))
-        self.items.append(item); self.selected_item = item
-        self.prompt.clear(); self.references.clear(); self._refresh_refs(); self._save_and_refresh(); self.start_next()
+        self.items.append(item); self.selected_item = item; self.fresh_next = False
+        self.prompt.clear(); self.references.clear(); self._refresh_refs(); self._save_and_refresh(); self._update_chain_ui(); self.start_next()
 
     def start_next(self) -> None:
         if self.engine_thread or self.rewrite_thread: return
         item = next((i for i in self.items if i.status == "queued"), None)
         if not item: self._set_running_ui(False); return
         self.running_item = item
-        if item.params.user_text and self.assistant_check.isChecked():
-            item.status = "thinking"; self._save_and_refresh(); self._set_running_ui(True, "助手正在理解提示词…")
-            previous = None
-            if item.params.refs:
-                previous_item = next((i for i in self.items if item.params.refs[0] in i.outputs), None)
-                previous = previous_item.params.prompt if previous_item else None
-            self.rewrite_thread = RewriteThread(item.params.user_text, previous, self.settings_data.assistant_model)
+        self.cancel_requested = False
+        p = item.params
+        # 发送时上一轮还没画完：现在取它的结果作为底图
+        if p.chain_from:
+            base = next((i for i in self.items if i.id == p.chain_from), None)
+            if base and base.outputs and base.outputs[0] not in p.refs:
+                p.refs.insert(0, base.outputs[0])
+            p.chain_from = None
+        if p.needs_rewrite:
+            p.needs_rewrite = False
+            text = p.user_text or p.prompt
+            chained = p.refs[0] if p.refs and any(p.refs[0] in i.outputs for i in self.items) else None
+            if chained and FRESH_RE.search(text):
+                p.refs.pop(0); chained = None
+                item.assistant_note = "你要求画一张新的，这次不基于上一张"
+            models = assistant.list_models()
+            official = self.settings_data.use_official_pe and assistant.pe_installed(models)
+            if not models:
+                item.assistant_note = "未检测到 Ollama，已按原话生成"
+                self._run_item(item); return
+            previous = next((i.params.prompt for i in self.items if chained and chained in i.outputs), None)
+            job = {
+                "official": official, "task": "edit" if p.refs else "t2i", "text": text,
+                "images": [self.paths.outputs / r for r in p.refs], "cache_dir": self.paths.models / "pe",
+                "previous": previous, "model": self.settings_data.assistant_model,
+            }
+            item.status = "thinking"; self._save_and_refresh()
+            self._set_running_ui(True, "官方改写模型思考中…（改图约 1~1.5 分钟）" if official else "助手正在理解提示词…")
+            self.rewrite_thread = RewriteThread(job)
             self.rewrite_thread.completed.connect(self._rewrite_done)
             self.rewrite_thread.failed.connect(self._rewrite_failed)
             self.rewrite_thread.finished.connect(self._rewrite_finished)
             self.rewrite_thread.start(); return
         self._run_item(item)
 
-    def _rewrite_done(self, mode: str, prompt: str, reason: str) -> None:
-        if not self.running_item: return
-        self.running_item.params.prompt = prompt; self.running_item.assistant_note = f"助手：{reason}"
-        if mode == "generate" and self.running_item.params.refs:
-            previous_outputs = {output for item in self.items if item.id != self.running_item.id for output in item.outputs}
-            if self.running_item.params.refs[0] in previous_outputs:
-                self.running_item.params.refs.pop(0)
-        self.running_item.status = "queued"
+    def _image_aspect(self, rel: str) -> float | None:
+        size = QImageReader(str(self.paths.outputs / rel)).size()
+        return size.width() / size.height() if size.isValid() and size.height() > 0 else None
+
+    def _rewrite_done(self, result: dict) -> None:
+        item = self.running_item
+        if not item: return
+        p, s = item.params, self.settings_data
+        p.prompt = result["prompt"]
+        if result["official"]:
+            p.assistant_mode = "edit" if result["task"] == "edit" else "generate"
+            note = f"官方改写模型 · 思考 {int(result['seconds'])} 秒"
+            if not s.custom_size and s.pe_ratio:
+                follow = result.get("ratio_follow", "")
+                digits = "".join(c for c in follow if c.isdigit())
+                if result["task"] == "edit" and follow.startswith("<image") and digits and 1 <= int(digits) <= len(p.refs):
+                    aspect = self._image_aspect(p.refs[int(digits) - 1])
+                    if aspect:
+                        p.width, p.height = fit_size(aspect, SIZE_TIERS.get(s.size_tier, 1.05))
+                        note += f" · 尺寸跟随第 {digits} 张参考图"
+                elif result.get("wh_ratio"):
+                    p.width, p.height = size_for_ratio(result["wh_ratio"], s.size_tier, (p.width, p.height))
+                    note += f" · 比例 {result['wh_ratio']}"
+            item.assistant_note = f"{item.assistant_note}；{note}" if item.assistant_note else note
+        else:
+            p.assistant_mode = result["mode"]
+            item.assistant_note = f"助手：{result['reason']}"
+            if result["mode"] == "generate" and p.refs:
+                previous_outputs = {o for i in self.items if i.id != item.id for o in i.outputs}
+                if p.refs[0] in previous_outputs:
+                    p.refs.pop(0)
+        item.status = "queued"
 
     def _rewrite_failed(self, message: str) -> None:
         if self.running_item:
@@ -575,7 +716,12 @@ class MainWindow(QMainWindow):
 
     def _rewrite_finished(self) -> None:
         item = self.running_item; self.rewrite_thread = None
-        if item: self._run_item(item)
+        if not item: return
+        if self.cancel_requested:
+            item.status = "cancelled"; self.running_item = None
+            self._save_and_refresh(); self._set_running_ui(False)
+            QTimer.singleShot(0, self.start_next); return
+        self._run_item(item)
 
     def _run_item(self, item: GenerationItem) -> None:
         item.status = "running"; self.log_lines.clear(); self._save_and_refresh(); self._set_running_ui(True, "准备中")
@@ -608,6 +754,12 @@ class MainWindow(QMainWindow):
         outputs = sorted(self.paths.outputs.glob(prefix + "*.png"))
         item.outputs = [path.relative_to(self.paths.outputs).as_posix() for path in outputs]
         item.duration = duration
+        # 去除 VAE 留下的 2px 网格
+        if item.params.degrid and not cancelled and code == 0:
+            self.stage.setText("去网格"); QApplication.processEvents()
+            for path in outputs:
+                try: degrid.process_file(path)
+                except Exception as exc: self._log(f"[WARN] 去网格失败 {path.name}: {exc}")
         if cancelled: item.status = "cancelled"
         elif code == 0 and outputs: item.status = "done"
         else:
@@ -622,7 +774,34 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self.start_next)
 
     def cancel(self) -> None:
+        self.cancel_requested = True
         if self.engine_thread: self.engine_thread.cancel()
+        elif self.rewrite_thread: self._set_running_ui(True, "正在停止，等助手这一步结束…")
+
+    # ------------------------------------------------------------------ #
+    # 官方改写模型安装
+    # ------------------------------------------------------------------ #
+    def install_pe(self) -> None:
+        installed = assistant.list_models()
+        for name in assistant.PE_MODELS.values():
+            if name in installed or name in self.pull_threads: continue
+            thread = PullThread(name)
+            thread.progress.connect(self._pull_progress)
+            thread.finished_with.connect(self._pull_done)
+            self.pull_threads[name] = thread
+            thread.start()
+
+    def _pull_progress(self, name: str, fraction: float, status: str) -> None:
+        label = "改图" if "I2I" in name else "文生图"
+        self.statusBar().showMessage(f"下载官方{label}改写模型：{fraction:.0%} {status}")
+
+    def _pull_done(self, name: str, error: str) -> None:
+        self.pull_threads.pop(name, None)
+        label = "改图" if "I2I" in name else "文生图"
+        if error:
+            self.statusBar().showMessage(f"官方{label}改写模型下载失败：{error}")
+        elif not self.pull_threads:
+            self.statusBar().showMessage("官方改写模型已安装，助手会自动使用", 15000)
 
     def _set_running_ui(self, running: bool, text: str = "") -> None:
         self.progress.setVisible(running); self.stage.setVisible(running)

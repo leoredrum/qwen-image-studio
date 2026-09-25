@@ -81,7 +81,7 @@ class EngineThread(QThread):
 
     def run(self) -> None:
         started = time.monotonic()
-        flags = subprocess.CREATE_NO_WINDOW
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # 非 Windows 上为 0，便于在其他系统上测试
         if os.name == "nt":
             flags |= subprocess.CREATE_NEW_PROCESS_GROUP
         try:
