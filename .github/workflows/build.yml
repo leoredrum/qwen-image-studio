@@ -66,7 +66,7 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.13"
 
       - name: 版本号
         run: |
@@ -93,7 +93,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path "..\out" | Out-Null
           Compress-Archive -Path "dist\Qwen Image Studio" -DestinationPath "..\out\Qwen-Image-Studio-Windows-$env:VERSION-portable.zip" -CompressionLevel Optimal
-          git archive --format zip -o "..\out\Qwen-Image-Studio-Windows-$env:VERSION-source.zip" HEAD:windows
+          git -C "$env:GITHUB_WORKSPACE" archive --format zip -o "$env:GITHUB_WORKSPACE\out\Qwen-Image-Studio-Windows-$env:VERSION-source.zip" HEAD:windows
           Get-ChildItem ..\out | Format-Table Name, Length
 
       - uses: actions/upload-artifact@v4
