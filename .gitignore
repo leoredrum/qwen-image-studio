@@ -13,3 +13,4 @@ app/icon/AppIcon.iconset/
 app/icon/icon_1024.png
 .DS_Store
 .swiftpm/
+/qwen image studio win/
