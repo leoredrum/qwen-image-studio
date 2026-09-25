@@ -1,0 +1,120 @@
+# 自动编译 macOS DMG 和 Windows 绿色版
+# - 发布 Release 时：两个平台一起编译，并把安装包挂到这个 Release 上
+# - 手动运行（Actions → Build → Run workflow）：只编译并上传为构建产物，用于试编译
+name: Build
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号（仅用于文件名）"
+        default: "dev"
+
+permissions:
+  contents: write
+
+env:
+  VERSION: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.version }}
+  SD_COMMIT: 88411ef
+
+jobs:
+  macos:
+    name: macOS DMG
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 版本号
+        run: echo "VERSION=${VERSION#v}" >> "$GITHUB_ENV"
+
+      # sd-cli 从源码编译较慢，按引擎版本缓存
+      - name: 缓存推理引擎
+        uses: actions/cache@v4
+        with:
+          path: app/vendor
+          key: sd-cli-macos-arm64-${{ env.SD_COMMIT }}-${{ hashFiles('app/build_engine.sh') }}
+
+      - name: 编译并打包 DMG
+        working-directory: app
+        run: ./make_dmg.sh "$VERSION"
+
+      - name: 检查产物
+        run: |
+          APP="Qwen Image Studio.app"
+          codesign --verify --deep --strict "$APP"
+          otool -l "$APP/Contents/Resources/bin/sd-cli" | grep -A4 LC_BUILD_VERSION | grep minos
+          test -x "$APP/Contents/Resources/bin/sd-cli"
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/*.dmg
+          if-no-files-found: error
+
+  windows:
+    name: Windows 绿色版
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: windows
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 版本号
+        run: |
+          $v = "$env:VERSION" -replace '^v', '' -replace '^windows-v', ''
+          "VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: 单元测试
+        run: |
+          python -m pip install -r requirements.txt
+          python -m unittest discover -s tests -v
+
+      - name: PyInstaller 打包
+        run: .\scripts\build-app.ps1 -Clean
+
+      - name: 冒烟测试（启动 15 秒不崩溃）
+        run: |
+          $p = Start-Process -FilePath "dist\Qwen Image Studio\Qwen Image Studio.exe" -PassThru
+          Start-Sleep -Seconds 15
+          if ($p.HasExited) { throw "程序启动后立即退出，退出码 $($p.ExitCode)" }
+          Stop-Process -Id $p.Id -Force
+          Write-Host "exe 启动正常"
+
+      - name: 打包 zip
+        run: |
+          New-Item -ItemType Directory -Force -Path "..\out" | Out-Null
+          Compress-Archive -Path "dist\Qwen Image Studio" -DestinationPath "..\out\Qwen-Image-Studio-Windows-$env:VERSION-portable.zip" -CompressionLevel Optimal
+          git archive --format zip -o "..\out\Qwen-Image-Studio-Windows-$env:VERSION-source.zip" HEAD:windows
+          Get-ChildItem ..\out | Format-Table Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: out/*.zip
+          if-no-files-found: error
+
+  release:
+    name: 挂到 Release
+    if: github.event_name == 'release'
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: 上传安装包
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -la assets
+          gh release upload "${{ github.event.release.tag_name }}" assets/* --clobber --repo "${{ github.repository }}"
